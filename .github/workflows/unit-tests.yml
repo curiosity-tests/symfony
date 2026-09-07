@@ -59,7 +59,15 @@ jobs:
     name: Unit Tests
 
     env:
-      extensions: amqp,apcu,brotli,igbinary,intl,mbstring,memcached,mongodb,redis,relay,zstd
+      # relay pinned, upstream leaves it floating. RedisProxiesTest asserts the
+      # checked-in Relay{,Cluster}Proxy.php matches the installed extension's
+      # reflection, so a relay release breaks this branch until the proxies are
+      # regenerated. relay 0.50.0 shipped and broke symfony/symfony@8.2 too
+      # (run 34026738227, same "KO src/Symfony/Component/Cache"); upstream fixed
+      # it in 7b357bcb24 "[Cache] Add support for relay 0.50", which lands AFTER
+      # the SHA this fork is pinned to. 0.40.0 is the release the pinned tree
+      # was regenerated for (5ab35ee4e4 / acca002992).
+      extensions: amqp,apcu,brotli,igbinary,intl,mbstring,memcached,mongodb,redis,relay-0.40.0,zstd
 
     strategy:
       matrix:
