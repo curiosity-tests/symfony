@@ -35,7 +35,7 @@ on:
         description: "racecar correlation token, echoed into the run name"
         type: string
         default: ""
-  push: { branches: [ '*.*' ] }
+  push: {branches: ['*.*']}
   pull_request:
 
 defaults:
@@ -43,8 +43,8 @@ defaults:
     shell: bash
 
 concurrency:
-    group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}-${{ inputs.leg || 'push' }}-${{ inputs.racecar_run }}
-    cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}-${{ inputs.leg || 'push' }}-${{ inputs.racecar_run }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -72,260 +72,327 @@ jobs:
     strategy:
       matrix:
         include:
-          - php: '8.4'
-            mode: high-deps
-          - php: '8.4'
-            mode: low-deps
-          - php: '8.4'
-          - php: '8.5'
-          - php: '8.6'
+        - php: '8.4'
+          mode: high-deps
+        - php: '8.4'
+          mode: low-deps
+        - php: '8.4'
+        - php: '8.5'
+        - php: '8.6'
       fail-fast: false
 
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout
-        uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-          persist-credentials: false
-          fetch-depth: 2
+    - name: Checkout
+      uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+        persist-credentials: false
+        fetch-depth: 2
 
-      - name: Assert instrumentation is live
-        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
-        # LD_PRELOAD once it has injected, so an empty value is what success
-        # looks like. co-hostd also daemonizes, so pgrep does not match it.
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Setup PHP
+      uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240   # 2.37.2
+      with:
+        coverage: "none"
+        ini-values: date.timezone=UTC,memory_limit=-1,default_socket_timeout=10,session.gc_probability=0,apc.enable_cli=1,zend.assertions=1,intl.default_locale=en,intl.error_level=0
+        php-version: "${{ matrix.php }}"
+        extensions: "${{ matrix.extensions || env.extensions }}"
+        tools: flex
 
+    - name: Install optional commands
+      if: matrix.php == '8.4'
+      run: |
+        sudo apt-get update
+        sudo apt-get install zopfli ffmpeg
 
-      - name: Setup PHP
-        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
-        with:
-          coverage: "none"
-          ini-values: date.timezone=UTC,memory_limit=-1,default_socket_timeout=10,session.gc_probability=0,apc.enable_cli=1,zend.assertions=1,intl.default_locale=en,intl.error_level=0
-          php-version: "${{ matrix.php }}"
-          extensions: "${{ matrix.extensions || env.extensions }}"
-          tools: flex
+    - name: Configure environment
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # Credentials are not persisted by the checkout, so remote operations are given
+        # the job token explicitly. Public repositories would also accept anonymous reads,
+        # private forks do not.
+        GIT_REMOTE="https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY"
 
-      - name: Install optional commands
-        if: matrix.php == '8.4'
-        run: |
-          sudo apt-get update
-          sudo apt-get install zopfli ffmpeg
+        git config --global user.email ""
+        git config --global user.name "Symfony"
+        git config --global init.defaultBranch main
+        git config --global advice.detachedHead false
 
-      - name: Configure environment
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Credentials are not persisted by the checkout, so remote operations are given
-          # the job token explicitly. Public repositories would also accept anonymous reads,
-          # private forks do not.
-          GIT_REMOTE="https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY"
+        (php --ri relay 2>&1 > /dev/null) || sudo rm -f /etc/php/*/cli/conf.d/20-relay.ini
 
-          git config --global user.email ""
-          git config --global user.name "Symfony"
-          git config --global init.defaultBranch main
-          git config --global advice.detachedHead false
+        COMPOSER_HOME="$(composer config home)"
+        ([ -d "$COMPOSER_HOME" ] || mkdir "$COMPOSER_HOME") && cp .github/composer-config.json "$COMPOSER_HOME/config.json"
 
-          (php --ri relay 2>&1 > /dev/null) || sudo rm -f /etc/php/*/cli/conf.d/20-relay.ini
+        echo COLUMNS=120 >> $GITHUB_ENV
+        echo PHPUNIT="$(pwd)/phpunit --exclude-group tty --exclude-group benchmark --exclude-group intl-data --exclude-group integration --exclude-group transient" >> $GITHUB_ENV
+        echo COMPOSER_UP='composer update --no-progress --ansi'$([[ "${{ matrix.mode }}" != low-deps ]] && echo ' --ignore-platform-req=php+') >> $GITHUB_ENV
 
-          COMPOSER_HOME="$(composer config home)"
-          ([ -d "$COMPOSER_HOME" ] || mkdir "$COMPOSER_HOME") && cp .github/composer-config.json "$COMPOSER_HOME/config.json"
+        SYMFONY_VERSION=$(grep ' VERSION = ' src/Symfony/Component/HttpKernel/Kernel.php | cut -d "'" -f2 | cut -d '.' -f 1-2)
+        SYMFONY_FEATURE_BRANCH=$(curl -s https://raw.githubusercontent.com/symfony/recipes/flex/main/index.json | jq -r '.versions."dev-name"')
 
-          echo COLUMNS=120 >> $GITHUB_ENV
-          echo PHPUNIT="$(pwd)/phpunit --exclude-group tty --exclude-group benchmark --exclude-group intl-data --exclude-group integration --exclude-group transient" >> $GITHUB_ENV
-          echo COMPOSER_UP='composer update --no-progress --ansi'$([[ "${{ matrix.mode }}" != low-deps ]] && echo ' --ignore-platform-req=php+') >> $GITHUB_ENV
+        # Install the phpunit-bridge from a PR if required
+        #
+        # To run a PR with a patched phpunit-bridge, first submit the patch for the
+        # phpunit-bridge as a separate PR against the next feature-branch then
+        # uncomment and update the following line with that PR number
+        #SYMFONY_PHPUNIT_BRIDGE_PR=32886
 
-          SYMFONY_VERSION=$(grep ' VERSION = ' src/Symfony/Component/HttpKernel/Kernel.php | cut -d "'" -f2 | cut -d '.' -f 1-2)
-          SYMFONY_FEATURE_BRANCH=$(curl -s https://raw.githubusercontent.com/symfony/recipes/flex/main/index.json | jq -r '.versions."dev-name"')
+        if [[ $SYMFONY_PHPUNIT_BRIDGE_PR ]]; then
+          git fetch --depth=2 "$GIT_REMOTE" refs/pull/$SYMFONY_PHPUNIT_BRIDGE_PR/head
+          git rm -rq src/Symfony/Bridge/PhpUnit
+          git checkout -q FETCH_HEAD -- src/Symfony/Bridge/PhpUnit
+          SYMFONY_PHPUNIT_BRIDGE_REF=$(curl -s https://api.github.com/repos/symfony/symfony/pulls/$SYMFONY_PHPUNIT_BRIDGE_PR | jq -r .base.ref)
+          sed -i 's/"symfony\/phpunit-bridge": ".*"/"symfony\/phpunit-bridge": "'$SYMFONY_PHPUNIT_BRIDGE_REF'.x@dev"/' composer.json
+          rm -rf .phpunit
+        fi
 
-          # Install the phpunit-bridge from a PR if required
-          #
-          # To run a PR with a patched phpunit-bridge, first submit the patch for the
-          # phpunit-bridge as a separate PR against the next feature-branch then
-          # uncomment and update the following line with that PR number
-          #SYMFONY_PHPUNIT_BRIDGE_PR=32886
+        # Create local composer packages for each patched components and reference them in composer.json files when cross-testing components
+        if [[ ! "${{ matrix.mode }}" = *-deps ]]; then
+          php .github/build-packages.php HEAD^ $SYMFONY_VERSION src/Symfony/Bridge/PhpUnit
+        else
+          echo SYMFONY_DEPRECATIONS_HELPER=weak >> $GITHUB_ENV
+          cp composer.json composer.json.orig
+          echo -e '{\n"require":{'"$(grep phpunit-bridge composer.json)"'"php":"*"},"minimum-stability":"dev"}' > composer.json
+          php .github/build-packages.php HEAD^ $SYMFONY_VERSION $(find src/Symfony -mindepth 2 -type f -name composer.json -printf '%h\n' | grep -v src/Symfony/Component/Emoji/Resources/bin)
+          mv composer.json composer.json.phpunit
+          mv composer.json.orig composer.json
+        fi
+        if [[ $SYMFONY_PHPUNIT_BRIDGE_PR ]]; then
+          git rm -fq -- src/Symfony/Bridge/PhpUnit/composer.json
+          git diff --staged -- src/Symfony/Bridge/PhpUnit/ | git apply -R --index
+        fi
 
-          if [[ $SYMFONY_PHPUNIT_BRIDGE_PR ]]; then
-            git fetch --depth=2 "$GIT_REMOTE" refs/pull/$SYMFONY_PHPUNIT_BRIDGE_PR/head
-            git rm -rq src/Symfony/Bridge/PhpUnit
-            git checkout -q FETCH_HEAD -- src/Symfony/Bridge/PhpUnit
-            SYMFONY_PHPUNIT_BRIDGE_REF=$(curl -s https://api.github.com/repos/symfony/symfony/pulls/$SYMFONY_PHPUNIT_BRIDGE_PR | jq -r .base.ref)
-            sed -i 's/"symfony\/phpunit-bridge": ".*"/"symfony\/phpunit-bridge": "'$SYMFONY_PHPUNIT_BRIDGE_REF'.x@dev"/' composer.json
-            rm -rf .phpunit
+        # For the highest branch, in high-deps mode, the version before it is checked out and tested with the locally patched components
+        if [[ "${{ matrix.mode }}" = high-deps ]]; then
+          SYMFONY_VERSIONS=$(git ls-remote -q --heads "$GIT_REMOTE" | cut -f2 | grep -o '/[1-9][0-9]*\.[0-9].*' | sort -V)
+
+          if [[ $SYMFONY_VERSION = $(echo "$SYMFONY_VERSIONS" | tail -n 1 | sed s/.//) ]]; then
+            echo FLIP='^' >> $GITHUB_ENV
+            SYMFONY_VERSION=$(echo "$SYMFONY_VERSIONS" | grep -FB1 /$SYMFONY_VERSION | head -n 1 | sed s/.//)
+            git fetch --depth=2 "$GIT_REMOTE" $SYMFONY_VERSION
+            git checkout -m FETCH_HEAD
+            echo COMPONENTS=$(find src/Symfony -mindepth 2 -type f -name phpunit.xml.dist -printf '%h ') >> $GITHUB_ENV
           fi
+        fi
 
-          # Create local composer packages for each patched components and reference them in composer.json files when cross-testing components
-          if [[ ! "${{ matrix.mode }}" = *-deps ]]; then
-            php .github/build-packages.php HEAD^ $SYMFONY_VERSION src/Symfony/Bridge/PhpUnit
-          else
-            echo SYMFONY_DEPRECATIONS_HELPER=weak >> $GITHUB_ENV
-            cp composer.json composer.json.orig
-            echo -e '{\n"require":{'"$(grep phpunit-bridge composer.json)"'"php":"*"},"minimum-stability":"dev"}' > composer.json
-            php .github/build-packages.php HEAD^ $SYMFONY_VERSION $(find src/Symfony -mindepth 2 -type f -name composer.json -printf '%h\n' | grep -v src/Symfony/Component/Emoji/Resources/bin)
-            mv composer.json composer.json.phpunit
-            mv composer.json.orig composer.json
-          fi
-          if [[ $SYMFONY_PHPUNIT_BRIDGE_PR ]]; then
-            git rm -fq -- src/Symfony/Bridge/PhpUnit/composer.json
-            git diff --staged -- src/Symfony/Bridge/PhpUnit/ | git apply -R --index
-          fi
+        # Skip the phpunit-bridge on bugfix-branches when not in *-deps mode
+        if [[ ! "${{ matrix.mode }}" = *-deps && $SYMFONY_VERSION != $SYMFONY_FEATURE_BRANCH ]]; then
+          echo COMPONENTS=$(find src/Symfony -mindepth 2 -type f -name phpunit.xml.dist -not -wholename '*/Bridge/PhpUnit/*' | xargs -I{} dirname {}) >> $GITHUB_ENV
+        else
+          echo COMPONENTS=$(find src/Symfony -mindepth 2 -type f -name phpunit.xml.dist | xargs -I{} dirname {}) >> $GITHUB_ENV
+        fi
 
-          # For the highest branch, in high-deps mode, the version before it is checked out and tested with the locally patched components
-          if [[ "${{ matrix.mode }}" = high-deps ]]; then
-            SYMFONY_VERSIONS=$(git ls-remote -q --heads "$GIT_REMOTE" | cut -f2 | grep -o '/[1-9][0-9]*\.[0-9].*' | sort -V)
+        # Legacy tests are skipped when deps=high and when the current branch version has not the same major version number as the next one
+        [[ "${{ matrix.mode }}" = high-deps && $SYMFONY_VERSION = *.4 ]] && echo LEGACY=" --exclude-group legacy" >> $GITHUB_ENV || true
 
-            if [[ $SYMFONY_VERSION = $(echo "$SYMFONY_VERSIONS" | tail -n 1 | sed s/.//) ]]; then
-              echo FLIP='^' >> $GITHUB_ENV
-              SYMFONY_VERSION=$(echo "$SYMFONY_VERSIONS" | grep -FB1 /$SYMFONY_VERSION | head -n 1 | sed s/.//)
-              git fetch --depth=2 "$GIT_REMOTE" $SYMFONY_VERSION
-              git checkout -m FETCH_HEAD
-              echo COMPONENTS=$(find src/Symfony -mindepth 2 -type f -name phpunit.xml.dist -printf '%h ') >> $GITHUB_ENV
-            fi
-          fi
+        echo SYMFONY_VERSION=$SYMFONY_VERSION >> $GITHUB_ENV
+        echo COMPOSER_ROOT_VERSION=$SYMFONY_VERSION.x-dev >> $GITHUB_ENV
+        echo SYMFONY_REQUIRE=">=$([ '${{ matrix.mode }}' = low-deps ] && echo 6.4 || echo $SYMFONY_VERSION)" >> $GITHUB_ENV
+        [[ "${{ matrix.mode }}" = *-deps ]] && mv composer.json.phpunit composer.json || true
 
-          # Skip the phpunit-bridge on bugfix-branches when not in *-deps mode
-          if [[ ! "${{ matrix.mode }}" = *-deps && $SYMFONY_VERSION != $SYMFONY_FEATURE_BRANCH ]]; then
-            echo COMPONENTS=$(find src/Symfony -mindepth 2 -type f -name phpunit.xml.dist -not -wholename '*/Bridge/PhpUnit/*' | xargs -I{} dirname {}) >> $GITHUB_ENV
-          else
-            echo COMPONENTS=$(find src/Symfony -mindepth 2 -type f -name phpunit.xml.dist | xargs -I{} dirname {}) >> $GITHUB_ENV
-          fi
+    - name: Install dependencies
+      run: |
+        echo "::group::composer update"
+        $COMPOSER_UP
+        echo "::endgroup::"
 
-          # Legacy tests are skipped when deps=high and when the current branch version has not the same major version number as the next one
-          [[ "${{ matrix.mode }}" = high-deps && $SYMFONY_VERSION = *.4 ]] && echo LEGACY=" --exclude-group legacy" >> $GITHUB_ENV || true
+        echo "::group::install phpunit"
+        ./phpunit install
+        echo "::endgroup::"
 
-          echo SYMFONY_VERSION=$SYMFONY_VERSION >> $GITHUB_ENV
-          echo COMPOSER_ROOT_VERSION=$SYMFONY_VERSION.x-dev >> $GITHUB_ENV
-          echo SYMFONY_REQUIRE=">=$([ '${{ matrix.mode }}' = low-deps ] && echo 6.4 || echo $SYMFONY_VERSION)" >> $GITHUB_ENV
-          [[ "${{ matrix.mode }}" = *-deps ]] && mv composer.json.phpunit composer.json || true
+    - name: Check return types
+      if: "matrix.php == '8.4' && ! matrix.mode"
+      run: |
+        sed -i 's/ *"\*\*\/Tests\/",//' composer.json
+        composer install -q --optimize-autoloader || composer install --optimize-autoloader
+        git checkout composer.json
+        php .github/patch-types.php lint
 
-      - name: Install dependencies
-        run: |
-          echo "::group::composer update"
-          $COMPOSER_UP
-          echo "::endgroup::"
+    - name: Run tests
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        GIT_REMOTE="https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY"
 
-          echo "::group::install phpunit"
-          ./phpunit install
-          echo "::endgroup::"
-
-      - name: Check return types
-        if: "matrix.php == '8.4' && ! matrix.mode"
-        run: |
-          sed -i 's/ *"\*\*\/Tests\/",//' composer.json
-          composer install -q --optimize-autoloader || composer install --optimize-autoloader
-          git checkout composer.json
-          php .github/patch-types.php lint
-
-      - name: Run tests
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          GIT_REMOTE="https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY"
-
-          _run_tests() {
-            local ok=0
-            local title="$1$FLIP"
-            local start=$(date -u +%s)
-
-            if [[ "${{ matrix.mode }}" = low-deps ]]; then
-              cd $1
-              composer config -q repositories.symfony '{"type": "path", "url": "$OLDPWD/.github/composer-lowest"}'
-              composer require -q --no-update symfony/composer-lowest
-            fi
-
-            OUTPUT=$(bash -xc "$2" 2>&1) || ok=$?
-            local end=$(date -u +%s)
-
-            if [[ $ok -ne 0 ]]; then
-              printf "\n%-70s%10s\n" $title $(($end-$start))s
-              echo "$OUTPUT"
-              echo "Job exited with: $ok"
-              echo -e "\n::error::KO $title\\n"
-            else
-              printf "::group::%-68s%10s\n" $title $(($end-$start))s
-              echo "$OUTPUT"
-              echo -e "\n\\e[32mOK\\e[0m $title\\n\\n::endgroup::"
-            fi
-
-            exit $ok
-          }
-          export -f _run_tests
-
-          if [[ ! "${{ matrix.mode }}" = *-deps ]]; then
-            echo "$COMPONENTS" | xargs -n1 | parallel -j +3 "_run_tests {} '$PHPUNIT {}'"
-
-            exit 0
-          fi
+        _run_tests() {
+          local ok=0
+          local title="$1$FLIP"
+          local start=$(date -u +%s)
 
           if [[ "${{ matrix.mode }}" = low-deps ]]; then
-            echo "$COMPONENTS" | xargs -n1 | parallel -j +3 "_run_tests {} '$COMPOSER_UP --prefer-lowest --prefer-stable && $PHPUNIT --do-not-fail-on-deprecation --do-not-fail-on-phpunit-notice'"
-
-            exit 0
+            cd $1
+            composer config -q repositories.symfony '{"type": "path", "url": "$OLDPWD/.github/composer-lowest"}'
+            composer require -q --no-update symfony/composer-lowest
           fi
 
-          # matrix.mode = high-deps
-          echo "$COMPONENTS" | xargs -n1 | parallel -j +3 "_run_tests {} 'cd {} && $COMPOSER_UP && $PHPUNIT$LEGACY --do-not-fail-on-deprecation'" || X=1
+          OUTPUT=$(bash -xc "$2" 2>&1) || ok=$?
+          local end=$(date -u +%s)
 
-          # get a list of the patched components (relies on .github/build-packages.php being called in the previous step)
-          PATCHED_COMPONENTS=$(git diff --name-only src/ | grep composer.json || true)
+          if [[ $ok -ne 0 ]]; then
+            printf "\n%-70s%10s\n" $title $(($end-$start))s
+            echo "$OUTPUT"
+            echo "Job exited with: $ok"
+            echo -e "\n::error::KO $title\\n"
+          else
+            printf "::group::%-68s%10s\n" $title $(($end-$start))s
+            echo "$OUTPUT"
+            echo -e "\n\\e[32mOK\\e[0m $title\\n\\n::endgroup::"
+          fi
 
-          # for 7.4 LTS, checkout and test previous major with the patched components (only for patched components)
-          if [[ $PATCHED_COMPONENTS && $SYMFONY_VERSION = 7.4 && $FLIP = '' ]]; then
-              export FLIP='^'
-              SYMFONY_VERSION=$(echo $SYMFONY_VERSION | awk '{print $1 - 1}')
-              echo -e "\\n\\e[33;1mChecking out Symfony $SYMFONY_VERSION and running tests with patched components as deps\\e[0m"
-              export COMPOSER_ROOT_VERSION=$SYMFONY_VERSION.x-dev
-              export SYMFONY_REQUIRE=">=$SYMFONY_VERSION"
-              git fetch --depth=2 "$GIT_REMOTE" $SYMFONY_VERSION
-              git checkout -m FETCH_HEAD
-              PATCHED_COMPONENTS=$(echo "$PATCHED_COMPONENTS" | xargs dirname | xargs -I{} bash -c "[ -e '{}/phpunit.xml.dist' ] && echo '{}'" | sort || true)
-              if [[ $PATCHED_COMPONENTS ]]; then
-                echo "::group::install phpunit"
-                ./phpunit install
-                echo "::endgroup::"
-                echo "$PATCHED_COMPONENTS" | parallel -j +3 "_run_tests {} 'cd {} && rm composer.lock vendor/ -Rf && $COMPOSER_UP && $PHPUNIT --exclude-group tty,benchmark,intl-data,integration,transient,legacy'" || X=1
+          exit $ok
+        }
+        export -f _run_tests
+
+        if [[ ! "${{ matrix.mode }}" = *-deps ]]; then
+          echo "$COMPONENTS" | xargs -n1 | parallel -j +3 "_run_tests {} '$PHPUNIT {}'"
+
+          exit 0
+        fi
+
+        if [[ "${{ matrix.mode }}" = low-deps ]]; then
+          echo "$COMPONENTS" | xargs -n1 | parallel -j +3 "_run_tests {} '$COMPOSER_UP --prefer-lowest --prefer-stable && $PHPUNIT --do-not-fail-on-deprecation --do-not-fail-on-phpunit-notice'"
+
+          exit 0
+        fi
+
+        # matrix.mode = high-deps
+        echo "$COMPONENTS" | xargs -n1 | parallel -j +3 "_run_tests {} 'cd {} && $COMPOSER_UP && $PHPUNIT$LEGACY --do-not-fail-on-deprecation'" || X=1
+
+        # get a list of the patched components (relies on .github/build-packages.php being called in the previous step)
+        PATCHED_COMPONENTS=$(git diff --name-only src/ | grep composer.json || true)
+
+        # for 7.4 LTS, checkout and test previous major with the patched components (only for patched components)
+        if [[ $PATCHED_COMPONENTS && $SYMFONY_VERSION = 7.4 && $FLIP = '' ]]; then
+            export FLIP='^'
+            SYMFONY_VERSION=$(echo $SYMFONY_VERSION | awk '{print $1 - 1}')
+            echo -e "\\n\\e[33;1mChecking out Symfony $SYMFONY_VERSION and running tests with patched components as deps\\e[0m"
+            export COMPOSER_ROOT_VERSION=$SYMFONY_VERSION.x-dev
+            export SYMFONY_REQUIRE=">=$SYMFONY_VERSION"
+            git fetch --depth=2 "$GIT_REMOTE" $SYMFONY_VERSION
+            git checkout -m FETCH_HEAD
+            PATCHED_COMPONENTS=$(echo "$PATCHED_COMPONENTS" | xargs dirname | xargs -I{} bash -c "[ -e '{}/phpunit.xml.dist' ] && echo '{}'" | sort || true)
+            if [[ $PATCHED_COMPONENTS ]]; then
+              echo "::group::install phpunit"
+              ./phpunit install
+              echo "::endgroup::"
+              echo "$PATCHED_COMPONENTS" | parallel -j +3 "_run_tests {} 'cd {} && rm composer.lock vendor/ -Rf && $COMPOSER_UP && $PHPUNIT --exclude-group tty,benchmark,intl-data,integration,transient,legacy'" || X=1
+            fi
+        fi
+
+        [[ ! $X ]] || (exit 1)
+
+    - name: Run TTY tests
+      if: "! matrix.mode"
+      run: |
+        script -e -c './phpunit --group tty' /dev/null
+
+    - name: Run AssetMapper without ext-brotli nor ext-zstd
+      if: "! matrix.mode"
+      run: |
+        sudo rm -f /etc/php/*/cli/conf.d/*-{brotli,zstd}.ini
+        ./phpunit src/Symfony/Component/AssetMapper
+
+    - name: Run tests with SIGCHLD enabled PHP
+      if: "matrix.php == '8.4' && ! matrix.mode"
+      run: |
+        mkdir build
+        cd build
+        wget -q https://github.com/symfony/binary-utils/releases/download/v0.1/php-8.4.1-pcntl-sigchild.tar.bz2
+        tar -xjf php-8.4.1-pcntl-sigchild.tar.bz2
+        cd ..
+
+        mkdir -p /opt/php/lib
+        echo memory_limit=-1 > /opt/php/lib/php.ini
+        ./phpunit install
+        ./build/php/bin/php ./phpunit src/Symfony/Component/Process
+
+    - name: Run PhpUnitBridge tests with PHPUnit 9.6
+      if: '! matrix.mode'
+      env:
+        SYMFONY_PHPUNIT_VERSION: '9.6'
+      run: |
+        cd src/Symfony/Bridge/PhpUnit
+        $COMPOSER_UP
+        $PHPUNIT -c phpunit-9.6.xml.dist
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
               fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
           fi
+        done
 
-          [[ ! $X ]] || (exit 1)
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
 
-      - name: Run TTY tests
-        if: "! matrix.mode"
-        run: |
-            script -e -c './phpunit --group tty' /dev/null
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
 
-      - name: Run AssetMapper without ext-brotli nor ext-zstd
-        if: "! matrix.mode"
-        run: |
-          sudo rm -f /etc/php/*/cli/conf.d/*-{brotli,zstd}.ini
-          ./phpunit src/Symfony/Component/AssetMapper
-
-      - name: Run tests with SIGCHLD enabled PHP
-        if: "matrix.php == '8.4' && ! matrix.mode"
-        run: |
-          mkdir build
-          cd build
-          wget -q https://github.com/symfony/binary-utils/releases/download/v0.1/php-8.4.1-pcntl-sigchild.tar.bz2
-          tar -xjf php-8.4.1-pcntl-sigchild.tar.bz2
-          cd ..
-
-          mkdir -p /opt/php/lib
-          echo memory_limit=-1 > /opt/php/lib/php.ini
-          ./phpunit install
-          ./build/php/bin/php ./phpunit src/Symfony/Component/Process
-
-      - name: Run PhpUnitBridge tests with PHPUnit 9.6
-        if: '! matrix.mode'
-        env:
-          SYMFONY_PHPUNIT_VERSION: '9.6'
-        run: |
-          cd src/Symfony/Bridge/PhpUnit
-          $COMPOSER_UP
-          $PHPUNIT -c phpunit-9.6.xml.dist
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
